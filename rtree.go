@@ -7,6 +7,7 @@ package rtreego
 
 import (
 	"fmt"
+	"log"
 	"math"
 	"sort"
 )
@@ -32,6 +33,155 @@ func NewTree(Dim, MinChildren, MaxChildren int) *Rtree {
 	rt.root.leaf = true
 	rt.root.level = 1
 	return &rt
+}
+
+type SpatialSlice struct {
+	spatials  []Spatial
+	targetDim int
+}
+
+func (ss SpatialSlice) Len() int { return len(ss.spatials) }
+
+func (ss SpatialSlice) Less(i, j int) bool {
+	return ss.spatials[i].Bounds().Centroid()[ss.targetDim] <
+		ss.spatials[j].Bounds().Centroid()[ss.targetDim]
+}
+
+func (ss SpatialSlice) Swap(i, j int) {
+	ss.spatials[i], ss.spatials[j] = ss.spatials[j], ss.spatials[i]
+}
+
+// NewPackedTree creates a new R-tree instance, and packs the provided objs into
+// it using a Tile-Sort-Recursive algorithm. TSR is described by Rigaux, Scholl
+// & Voisard in "Spatial Databases: With Application to GIS" (c. 2002, pg. 255).
+// For best performance, after construction, no changes should be made to the tree.
+func NewPackedTree(Dim, MinChildren, MaxChildren int, objs []Spatial) *Rtree {
+	rtree := NewTree(Dim, MinChildren, MaxChildren)
+	root := packRoot(MaxChildren, objs)
+	if root != nil {
+		rtree.size = len(objs)
+		rtree.height = root.level
+		rtree.root = root
+	}
+
+	return rtree
+}
+
+func packRoot(nodeSize int, objs []Spatial) *node {
+	spatials := packNodes(nodeSize, objs, 1)
+	if len(spatials) == 1 {
+		return spatials[0].(*node)
+	}
+
+	log.Println("Attempted to TSR pack Rtree, but could not create a root node. Was the provided slice of spatials empty?")
+	return nil
+}
+
+// Recurisvely packs into a hierarchy of spatially arranged nodes.
+func packNodes(nodeSize int, objs []Spatial, call int) []Spatial {
+	size := len(objs)
+	leaf := call == 1
+	// minimal number of leaves/child nodes
+	p := math.Ceil(float64(size) / float64(nodeSize))
+
+	// num of rows/columns in our square
+	sqr := math.Ceil(math.Sqrt(p))
+
+	// a little struct for sorting
+	x, y := 0, 1
+	ss := SpatialSlice{
+		spatials:  objs,
+		targetDim: x,
+	}
+
+	// sort the rects by the X coord of their centroids
+	sort.Sort(ss)
+
+	// partition into sqr # of vertical slices
+	cols := make([]SpatialSlice, 0, int(sqr))
+	colSize := int(math.Ceil(float64(size) / sqr))
+	for i, j := 0, colSize; ; i += colSize {
+		if j > size {
+			j = size
+		}
+
+		cols = append(cols, SpatialSlice{
+			spatials:  ss.spatials[i:j],
+			targetDim: y,
+		})
+
+		if j == size {
+			break
+		}
+
+		j += colSize
+	}
+
+	// break our grid up into nodes
+	nodes := make([]Spatial, 0, int(p))
+	for _, col := range cols {
+		// sort each column by the Y coord of the centroids
+		sort.Sort(col)
+		colSize := len(col.spatials)
+
+		// fill nodes with sequential runs of max size
+		// colSize is divisible by nodeSize (colSize = nodeSize * sqr)
+		// the last column is the only exception, which may be shorter
+		entries := make([]entry, 0, nodeSize)
+		for i, j := 0, nodeSize; ; i += nodeSize {
+			if j > colSize {
+				j = colSize
+			}
+
+			run := col.spatials[i:j]
+			for _, obj := range run {
+				var e entry
+				if leaf {
+					e = entry{
+						bb:  obj.Bounds(),
+						obj: obj,
+					}
+				} else {
+					node := obj.(*node)
+					e = entry{
+						bb:    node.Bounds(),
+						child: node,
+					}
+				}
+
+				entries = append(entries, e)
+			}
+
+			if j == colSize {
+				break
+			}
+
+			j += nodeSize
+		}
+
+		n := &node{
+			leaf:    leaf,
+			parent:  nil, // we don't know our parent yet, we may even be the root
+			entries: entries,
+			level:   call,
+		}
+
+		if !leaf {
+			// the entries aren't leaves, they're nodes and nodes have parents
+			for _, e := range entries {
+				e.child.parent = n
+			}
+		}
+		nodes = append(nodes, Spatial(n))
+	}
+
+	if len(nodes) > 1 {
+		// there's still packing to do
+		return packNodes(nodeSize, nodes, call+1)
+	}
+
+	// containing just the root node
+	return nodes
 }
 
 // Size returns the number of objects currently stored in tree.
@@ -115,8 +265,8 @@ func (tree *Rtree) insert(e entry, level int) {
 			parent: nil,
 			level:  tree.height,
 			entries: []entry{
-				entry{bb: oldRoot.computeBoundingBox(), child: oldRoot},
-				entry{bb: splitRoot.computeBoundingBox(), child: splitRoot},
+				entry{bb: oldRoot.Bounds(), child: oldRoot},
+				entry{bb: splitRoot.Bounds(), child: splitRoot},
 			},
 		}
 		oldRoot.parent = tree.root
@@ -154,7 +304,7 @@ func (tree *Rtree) adjustTree(n, nn *node) (*node, *node) {
 
 	// Re-size the bounding box of n to account for lower-level changes.
 	en := n.getEntry()
-	en.bb = n.computeBoundingBox()
+	en.bb = n.Bounds()
 
 	// If nn is nil, then we're just propagating changes upwards.
 	if nn == nil {
@@ -163,7 +313,7 @@ func (tree *Rtree) adjustTree(n, nn *node) (*node, *node) {
 
 	// Otherwise, these are two nodes resulting from a split.
 	// n was reused as the "left" node, but we need to add nn to n.parent.
-	enn := entry{nn.computeBoundingBox(), nn, nil}
+	enn := entry{nn.Bounds(), nn, nil}
 	n.parent.entries = append(n.parent.entries, enn)
 
 	// If the new entry overflows the parent, split the parent and propagate.
@@ -187,8 +337,8 @@ func (n *node) getEntry() *entry {
 	return e
 }
 
-// computeBoundingBox finds the MBR of the children of n.
-func (n *node) computeBoundingBox() (bb *Rect) {
+// Bounds finds the MBR of the children of n.
+func (n *node) Bounds() (bb *Rect) {
 	childBoxes := make([]*Rect, len(n.entries))
 	for i, e := range n.entries {
 		childBoxes[i] = e.bb
@@ -254,8 +404,8 @@ func assign(e entry, group *node) {
 
 // assignGroup chooses one of two groups to which a node should be added.
 func assignGroup(e entry, left, right *node) {
-	leftBB := left.computeBoundingBox()
-	rightBB := right.computeBoundingBox()
+	leftBB := left.Bounds()
+	rightBB := right.Bounds()
 	leftEnlarged := boundingBox(leftBB, e.bb)
 	rightEnlarged := boundingBox(rightBB, e.bb)
 
@@ -306,8 +456,8 @@ func (n *node) pickSeeds() (int, int) {
 // pickNext chooses an entry to be added to an entry group.
 func pickNext(left, right *node, entries []entry) (next int) {
 	maxDiff := -1.0
-	leftBB := left.computeBoundingBox()
-	rightBB := right.computeBoundingBox()
+	leftBB := left.Bounds()
+	rightBB := right.Bounds()
 	for i, e := range entries {
 		d1 := boundingBox(leftBB, e.bb).size() - leftBB.size()
 		d2 := boundingBox(rightBB, e.bb).size() - rightBB.size()
@@ -402,14 +552,14 @@ func (tree *Rtree) condenseTree(n *node) {
 			}
 		} else {
 			// just a child entry deletion, no underflow
-			n.getEntry().bb = n.computeBoundingBox()
+			n.getEntry().bb = n.Bounds()
 		}
 		n = n.parent
 	}
 
 	for _, n := range deleted {
 		// reinsert entry so that it will remain at the same level as before
-		e := entry{n.computeBoundingBox(), n, nil}
+		e := entry{n.Bounds(), n, nil}
 		tree.insert(e, n.level+1)
 	}
 }

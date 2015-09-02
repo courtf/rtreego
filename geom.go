@@ -137,6 +137,14 @@ func (r *Rect) LengthsCoord(i int) float64 {
 	return r.q[i] - r.p[i]
 }
 
+func (r *Rect) Centroid() Point {
+	point := make(Point, len(r.q))
+	for i, _ := range r.q {
+		point[i] = (r.LengthsCoord(i) / 2)
+	}
+	return point
+}
+
 // Returns true if the two rectangles are equal
 func (r *Rect) Equal(other *Rect) bool {
 	for i, e := range r.p {
